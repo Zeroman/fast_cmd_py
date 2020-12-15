@@ -1,0 +1,5 @@
+numpy
+pandas
+matplotlib
+PrettyTable
+prompt_toolkit
