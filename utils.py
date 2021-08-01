@@ -10,7 +10,11 @@ import os
 import pandas as pd
 import numpy as np
 import sys
+import shutil
 from inspect import isfunction
+# import dateutil
+import requests
+import wcwidth
 from dateutil.parser import parse
 import prettytable as pt
 from pandas._libs.tslibs.timestamps import Timestamp
@@ -100,6 +104,13 @@ def format_datetime(param, format='%y/%m/%d %H:%M:%S'):
     if _d is not None:
         return _d.strftime(format)
     return ''
+
+
+def format_percentage(number, decimal=2):
+    if type(number) is str:
+        return ''
+    _format = '%.{}f%%'.format(decimal)
+    return _format % (number * 100)
 
 
 def clear_screen():
@@ -409,10 +420,17 @@ def get_pkl_files(dir_name):
 
 
 class PrettyTable(pt.PrettyTable):
-    def __init__(self, fields={}, data=None, map_func=None, func_params=None, rename={}, hide_cols=[], sum_cols=[], show_index=False,
-                 default_float_format='.2', default_align='c', start=0, end=None, title=None, **kwargs):
+    _re = re.compile(r"\033\[[0-9;]*m")
+
+    def __init__(self, fields={}, data=None, map_func=None, func_params=None, vertical=False,
+                 rename={}, hide_cols=[], sum_cols=[], show_index=False, format_func={},
+                 text_color=None, int_format=None, float_format=.2, align=None,
+                 max_col_width=None, start=0, end=None, title=None, **kwargs):
         super().__init__()
+        self._format_func = {}
         self._title = title
+        self.text_color = text_color
+        self.__alias_name = rename
         if data is None:
             data = {}
         if isinstance(data, dict):
@@ -431,13 +449,32 @@ class PrettyTable(pt.PrettyTable):
         if len(fields) == 0 and len(data) > 0:
             keys = data[0].keys()
             fields = dict(zip(keys, keys))
-        self._data = data[start:end]
-        self._map_func = map_func
-        self._func_params = func_params
         self._sum_cols = sum_cols
         self._hide_cols = hide_cols
+        self._data = data[start:end]
+        self._data_len = len(self._data)
+        self._vertical_fields = {}
+        self._vertical_data = []
+        self._vertical_data_len = 0
+        if vertical and self._data_len > 0:
+            lines = []
+            for field in fields:
+                line = {'name': field}
+                for i in range(self._data_len):
+                    name = '%d' % (i + 1)
+                    line[name] = self._data[i][field]
+                lines.append(line)
+            keys = list(lines[0].keys())
+            if len(self._sum_cols) > 0:
+                keys.append("sum")
+            self._vertical_fields = dict(zip(keys, keys))
+            self._vertical_data = lines
+            self._vertical_data_len = len(self._vertical_data)
+        self._map_func = map_func
+        self._func_params = func_params
         self._show_index = False
         self._index = 1
+        self._max_col_width = max_col_width
         field_align = {}
         field_float_format = {}
         self.field_time_format = {}
@@ -470,34 +507,128 @@ class PrettyTable(pt.PrettyTable):
             if k.endswith("_title"):
                 name = k[:k.find('_title')]
                 field_dict[name] = v
+        self._field_dict = field_dict
         fields = list(field_dict.values())
         if show_index and 'index' not in field_dict:
             self._show_index = True
             fields.insert(0, '序号')
         # print(fields)
         self.field_names = fields
-        self.float_format = default_float_format
-        self.align = default_align
+        if int_format is not None:
+            self.int_format = str(int_format)
+        if type(float_format) is float:
+            self.float_format = str(float_format)
+        elif type(float_format) is str:
+            self.float_format = float_format
+        elif type(float_format) is dict:
+            for key in ['', 'default', 'None']:
+                if key in float_format:
+                    self.float_format = str(float_format[key])
+            for key in float_format:
+                if key in ['', 'default', 'None']:
+                    continue
+                self.float_format[key] = str(float_format[key])
+        if type(align) is str:
+            self.align = align
+        elif type(align) is dict:
+            for key in ['', 'default', 'None']:
+                if key in align:
+                    self.align = align[key]
+            for key in align:
+                if key in ['', 'default', 'None']:
+                    continue
+                self.align[key] = str(align[key])
+        else:
+            self.align = 'c'
         self.align['序号'] = 'r'
         # print(field_align)
         for name in field_align:
             self.align[name] = field_align[name]
         for name in field_float_format:
             self.float_format[name] = field_float_format[name]
-        for k, v in kwargs.items():
-            if k.endswith("_float_format"):
-                name = k[:k.find('_float_format')]
-                self.float_format[field_dict[name]] = v
-        self._field_dict = field_dict
+        if isinstance(format_func, dict):
+            for k, v in format_func.items():
+                name = self.field_name(k)
+                self._format_func[name] = v
+        self.__proc_kwargs_params(**kwargs)
+
         # print(self.field_names)
         # print(self._field_dict)
         if self._data is not None:
             self.add(self._data)
 
+    def __proc_kwargs_params(self, **kwargs):
+        for k, v in kwargs.items():
+            if k.endswith("_align"):
+                name = k[:k.find('_align')]
+                name = self.field_name(name)
+                self.align[name] = v
+            if k.endswith("_float_format"):
+                name = k[:k.find('_float_format')]
+                name = self.field_name(name)
+                self.float_format[name] = v
+            if k.endswith("_int_format"):
+                name = k[:k.find('_int_format')]
+                name = self.field_name(name)
+                self.int_format[name] = v
+            if k.endswith("_max_col_width"):
+                name = k[:k.find('_max_col_width')]
+                name = self.field_name(name)
+                self.set_max_col_width(name, v)
+            if k.endswith("_format_func"):
+                name = k[:k.find('_format_func')]
+                name = self.field_name(name)
+                self._format_func[name] = v
+        if type(self.text_color) is dict:
+            for key in list(self.text_color.keys()):
+                name = self.field_name(key)
+                self.text_color[name] = self.text_color[key]
+
+    def set_max_col_width(self, name, value):
+        if self._max_col_width is None:
+            self._max_col_width = {}
+        if type(self._max_col_width) is int:
+            self._max_col_width = {'': self._max_col_width}
+        self._max_col_width[name] = value
+
+    def alias_name(self, name):
+        if name in self.__alias_name:
+            return self.__alias_name[name]
+        return name
+
+    def field_name(self, name):
+        name = self.alias_name(name)
+        if name in self._field_dict:
+            return self._field_dict[name]
+        return name
+
+    def str_block_width(self, val):
+        return wcwidth.wcswidth(self._re.sub("", val))
+
+    def max_col_width(self, name):
+        if type(self._max_col_width) is float:
+            return int(self._max_col_width)
+        if type(self._max_col_width) is int:
+            return self._max_col_width
+        max_col_width = int(shutil.get_terminal_size().columns / 2)
+        if type(self._max_col_width) is dict:
+            default_col_width = self._max_col_width.get('', max_col_width)
+            return int(self._max_col_width.get(name, default_col_width))
+        return int(max_col_width)
+
     def add(self, data):
         for row in data:
             if row and self._map_func is not None:
                 row = self._map_func(row, self._func_params)
+            if row and self._max_col_width:
+                for k, v in row.items():
+                    if type(v) is not str:
+                        v = str(v)
+                    width = self.str_block_width(v)
+                    max_col_width = self.max_col_width(k)
+                    # print(width, max_col_width)
+                    if width > max_col_width:
+                        row[k] = v[:max_col_width] + '...'
             self.add_row(row)
 
         sum_row = {}
@@ -538,6 +669,39 @@ class PrettyTable(pt.PrettyTable):
             row.append(v)
         # print(row)
         super().add_row(row)
+
+    def _format_rows(self, rows, options):
+        _rows = super()._format_rows(rows, options)
+        if self._vertical_data_len == 0:
+            return _rows
+        _v_rows = np.array(_rows).T.tolist()
+        for index, _row in enumerate(_v_rows):
+            _row.insert(0, self._field_names[index])
+        self._field_names = list(self._vertical_fields.keys())
+        for field in self._field_names:
+            self._align[field] = "c"
+            self._valign[field] = "t"
+        return _v_rows
+
+    def _format_value(self, field, value):
+        _value = super(PrettyTable, self)._format_value(field, value)
+        if field in self._format_func and value != '':
+            _value = self._format_func[field](value)
+        _value = str(_value)
+        color = None
+        if type(self.text_color) is str:
+            color = self.text_color
+        if type(self.text_color) is dict:
+            if field in self.text_color:
+                color = self.text_color[field]
+            elif '' in self.text_color:
+                color = self.text_color['']
+            elif None in self.text_color:
+                color = self.text_color[None]
+        if color:
+            return colored(_value, color)
+        else:
+            return _value
 
     def print(self):
         # if self._title:
@@ -830,45 +994,68 @@ def run_cmd_shell(argv=[], prefix='cmd-> ', words=[], cmd_func=None):
                 cmd_func(args)
 
 
-def run_shell(prefix=None, all_cmd_table={}, globals_params={}, params_options={}, module_name="__main__"):
+def run_shell(prefix=None, all_cmd_table={}, globals_params={}, params_options={}, param_func=None, module_name="__main__"):
     def _set_default_global_params(key, value):
         if key not in globals_params:
             globals_params[key] = value
 
-    def _process_global_params(args: list):
+    def _process_default_global_params():
         _set_default_global_params('debug', False)
         _set_default_global_params('start', to_datetime('2020-06-01 00:00'))
         _set_default_global_params('end', to_datetime('2020-07-01 00:00'))
 
+    def _process_global_commands(args: list):
         cmd_all = {}
         for arg in args[:]:
             if arg == '-':
                 break
             cmd = arg
+            _cmd = None
             if '=' in arg:
                 cmd = arg[:arg.index('=') + 1]
-            search_list = fuzzy_finder(cmd, all_cmd_table.keys())
-            if len(search_list) > 1:
-                print("%s is %s" % (arg, ','.join(search_list)))
-                raise Exception("arg error")
-            if len(search_list) == 1:
-                _cmd = search_list[0]
+            all_cmd_name_list = list(all_cmd_table.keys())
+            if cmd in all_cmd_name_list:
+                _cmd = cmd
+            if not _cmd:
+                _cmd_short_name_list = [''.join([w[0] for w in cmd.split('_')]) for cmd in all_cmd_name_list]
+                _cmd_count = _cmd_short_name_list.count(cmd)
+                if _cmd_count > 1:
+                    info = ['%s->%s' % (cmd, all_cmd_name_list[i]) for i in enumerate(_cmd_short_name_list) if i == cmd]
+                    print("%s is %s" % (arg, info))
+                    raise Exception("arg more regex error")
+                elif _cmd_count == 1:
+                    _cmd = all_cmd_name_list[_cmd_short_name_list.index(cmd)]
+            if not _cmd:
+                search_list = fuzzy_finder(cmd, all_cmd_name_list)
+                if len(search_list) > 1:
+                    # 解决 hel->[--help, help]导致的目标重复问题
+                    func_list = set([all_cmd_table[__cmd] for __cmd in search_list])
+                    if len(func_list) == 1:
+                        _cmd = search_list[0]
+                    else:
+                        print("%s is %s" % (arg, ','.join(search_list)))
+                        raise Exception("arg error")
+                if not _cmd and len(search_list) == 1:
+                    _cmd = search_list[0]
+            if _cmd:
                 if _cmd in cmd_all.keys() or _cmd in cmd_all.values():
                     print('more cmd ', arg, cmd_all)
                     raise Exception("arg error")
                 cmd_all[arg] = _cmd
-                if _cmd == arg:
-                    args.remove(arg)
+                args.remove(arg)
+        return cmd_all
 
+    def _process_global_params(args: list):
+        match_args = set()
         now: datetime = get_datetime_now()
         for arg in args:
             if arg == '-':
                 break
-            name, value = ("", "")
+            name, _v = ("", "")
             if '=' not in arg:
                 name = arg
             else:
-                name, value = arg.split('=')
+                name, _v = arg.split('=')
             # print(name, '=', value)
             # search_list = list(filter(lambda s: s.startswith(name), globals_params))
             search_list = fuzzy_finder(arg, globals_params.keys())
@@ -882,64 +1069,81 @@ def run_shell(prefix=None, all_cmd_table={}, globals_params={}, params_options={
             if name in globals_params:
                 _type = type(globals_params[name])
                 if _type is datetime:
-                    globals_params[name] = to_datetime(value)
-                elif _type is bool and value == '':
+                    globals_params[name] = to_datetime(_v)
+                elif _type is bool and _v == '':
                     globals_params[name] = True
                 elif _type is int:
-                    globals_params[name] = int(value)
+                    globals_params[name] = int(_v)
                 else:
-                    globals_params[name] = value
+                    globals_params[name] = _v
+                match_args.add(arg)
             else:
-                if not value:
+                if not _v:
                     p_search_all = {}
                     for p_name, p_v_list in params_options.items():
-                        _search_list = list(filter(lambda x: arg in x.lower(), p_v_list))
-                        if _search_list and len(_search_list) == 1:
-                            p_search_all[p_name] = _search_list[0]
+                        _equal_list = list(filter(lambda x: arg.lower() == x.lower(), p_v_list))
+                        if _equal_list and len(_equal_list) == 1:
+                            p_search_all[p_name] = _equal_list[0]
+                        else:
+                            _search_list = list(filter(lambda x: arg in x.lower(), p_v_list))
+                            if _search_list and len(_search_list) == 1:
+                                p_search_all[p_name] = _search_list[0]
                     for _key, _item in p_search_all.items():
                         if globals_params.get(_key):
                             print("%s = %s, %s = %s already override" % (_key, globals_params[_key], _key, _item))
                         print("process params: %s -> %s = %s" % (arg, _key, _item))
                         globals_params[_key] = _item
+                        match_args.add(arg)
                 else:
-                    if value.isdigit():
-                        globals_params[name] = int(value)
-                    elif is_float(value):
-                        globals_params[name] = float(value)
+                    if _v.isdigit():
+                        globals_params[name] = int(_v)
+                    elif is_float(_v):
+                        globals_params[name] = float(_v)
                     else:
-                        globals_params[name] = value
+                        globals_params[name] = _v
+                    match_args.add(arg)
 
             # 匹配可选参数
             if name in params_options.keys():
-                search_list = list(filter(lambda x: value in x.lower(), params_options[name]))
+                search_list = list(filter(lambda x: _v in x.lower(), params_options[name]))
                 if len(search_list) == 1:
                     globals_params[name] = search_list[0]
-                    print(f"参数值匹配 {name}: {value} -> {globals_params[name]} ")
+                    print(f"参数值匹配 {name}: {_v} -> {globals_params[name]} ")
+                    match_args.add(arg)
 
             if name == 'month':
-                _d = value
+                _d = _v
                 if _d.isdigit():
-                    _d = datetime(year=now.year, month=int(value), day=1)
+                    _d = datetime(year=now.year, month=int(_v), day=1)
                 start, end = get_month_start_end(_d)
                 globals_params['start'] = start
                 globals_params['end'] = end
+                match_args.add(arg)
             if name in set(map(str, range(1999, 2030))):
-                name, value = 'year', name
+                name, _v = 'year', name
             if name == 'year':
-                _year = int(value)
+                _year = int(_v)
                 start = datetime(year=_year, month=1, day=1)
                 end = datetime(year=_year + 1, month=1, day=1)
                 globals_params['start'] = start
                 globals_params['end'] = end
-
-        return cmd_all
+                match_args.add(arg)
+        for arg in match_args:
+            args.remove(arg)
 
     def cmd_show_help():
         """显示帮助信息"""
-        help_info = []
+        help_info = {}
         for cmd, func in all_cmd_table.items():
-            help_info.append({'cmd': cmd, 'func_name': func.__name__, 'desc': func.__doc__})
-        PrettyTable(data=help_info, default_align='l').print()
+            doc = func.__doc__
+            desc = doc.split("\n")[0] if doc else ''
+            if func not in help_info:
+                help_info[func] = {'cmd': cmd, 'func_name': func.__name__, 'desc': desc}
+            else:
+                info = help_info[func]
+                info['cmd'] += ',' + cmd
+        max_col_width = shutil.get_terminal_size().columns / 2
+        PrettyTable(data=list(help_info.values()), align='l', desc_max_col_width=max_col_width).print()
 
     def cmd_show_vars():
         """显示全局变量信息"""
@@ -950,12 +1154,17 @@ def run_shell(prefix=None, all_cmd_table={}, globals_params={}, params_options={
         else:
             info = []
             for k, v in globals_params.items():
+                if k.startswith('_'):
+                    continue
                 info.append({"name": k, "value": v})
             info.sort(key=lambda x: x['name'])
-            PrettyTable(data=info, default_align='l').print()
+            max_col_width = shutil.get_terminal_size().columns / 2
+            PrettyTable(data=info, align='l', value_max_col_width=max_col_width).print()
 
     def _run_cmd_func(args):
-        cmd_all = _process_global_params(args)
+        _process_default_global_params()
+        _process_global_params(args)
+        cmd_all = _process_global_commands(args)
         # print(cmd_all)
         for arg, cmd in cmd_all.items():
             cmd_func = all_cmd_table.get(cmd)
@@ -971,11 +1180,12 @@ def run_shell(prefix=None, all_cmd_table={}, globals_params={}, params_options={
             file_name = os.path.basename(module.__file__)
             if file_name.endswith('.py'):
                 prefix = file_name[:-3] + "-> "
-    if 'help' not in all_cmd_table:
-        all_cmd_table['help'] = cmd_show_help
     if 'vars' not in all_cmd_table:
-        all_cmd_table['var='] = cmd_show_vars
         all_cmd_table['vars'] = cmd_show_vars
+    if 'help' not in all_cmd_table:
+        all_cmd_table['-h'] = cmd_show_help
+        all_cmd_table['--help'] = cmd_show_help
+        all_cmd_table['help'] = cmd_show_help
     if 'debug' not in globals_params.keys():
         globals_params['debug'] = False
     complete_words = list(all_cmd_table.keys())
@@ -983,6 +1193,8 @@ def run_shell(prefix=None, all_cmd_table={}, globals_params={}, params_options={
         for item in options:
             complete_words.append("%s=%s" % (key, item))
     for _key, value in globals_params.items():
+        if _key.startswith("_"):
+            continue
         _type = type(globals_params[_key])
         if _type is bool:
             complete_words.append("%s=true" % (_key))
